@@ -72,15 +72,42 @@ jobs:
           echo "reason=$reason" >> "$GITHUB_OUTPUT"
 
       - name: Keepalive репозитория
-        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # раз в сутки трогаем файл: репо без активности GitHub считает спящим
-          h="$(date -u +%H)"; m="$(date -u +%M)"
-          if [ "$h" != "03" ] || [ "$m" -ge 30 ]; then echo "не время keepalive"; exit 0; fi
+          # раз в сутки трогаем файл: репо без активности GitHub считает спящим.
+          # Критерий -- ВОЗРАСТ файла (по метке времени внутри него), а не попадание
+          # в узкое окно времени суток: расписание */30 на бесплатных раннерах дрейфует
+          # на часы, окно 03:00-03:30 UTC систематически проскакивалось (2026-09-02).
+          # Любой прогон позже срока сам догоняет и трогает файл -- дрейф расписания
+          # больше не имеет значения.
+          MAX_AGE_H=20
           F=".deadman_keepalive"
-          sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${F}" --jq .sha 2>/dev/null || true)"
+          resp="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${F}" 2>/dev/null || true)"
+          sha="$(printf '%s' "$resp" | jq -r '.sha // empty' 2>/dev/null || true)"
+          need_touch="yes"
+          if [ -n "$sha" ]; then
+            old_ts="$(printf '%s' "$resp" | jq -r '.content // empty' | tr -d '\n' | base64 -d 2>/dev/null \
+              | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' | head -1 || true)"
+            if [ -n "$old_ts" ]; then
+              old_epoch="$(date -u -d "$old_ts" +%s 2>/dev/null || true)"
+              if [ -n "$old_epoch" ]; then
+                age_h=$(( ( $(date -u +%s) - old_epoch ) / 3600 ))
+                echo "возраст ${F}: ${age_h}ч (порог ${MAX_AGE_H}ч)"
+                if [ "$age_h" -lt "$MAX_AGE_H" ]; then need_touch="no"; fi
+              else
+                echo "не смог разобрать метку времени в ${F}, трогаю на всякий случай"
+              fi
+            else
+              echo "${F} есть, но метка времени внутри не нашлась, трогаю на всякий случай"
+            fi
+          else
+            echo "${F} ещё нет -- касание немедленно, на первом же прогоне"
+          fi
+          if [ "$need_touch" = "no" ]; then
+            echo "рано, пропуск"
+            exit 0
+          fi
           content="$(date -u '+%Y-%m-%dT%H:%M:%SZ external deadman alive' | base64 -w0)"
           if [ -n "$sha" ]; then
             gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${F}" \
