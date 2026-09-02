@@ -1,0 +1,129 @@
+# Имя workflow видно в теме письма GitHub ("Run failed: <имя>"). Старое
+# "deadman-supervisor" ни о чём не говорило -- письмо читалось как поломка самого workflow,
+# а не как "сервер лёг", и через неделю такое начинают пропускать. Имя = суть тревоги.
+name: SERVER DOWN ALARM (external deadman)
+# ВНЕШНИЙ ДЕД-МАН. Живёт на инфре GitHub, ВНЕ нашего сервера.
+# Проверяет публичный штамп живости https://guardlabs.online/hb.txt
+# (пишет cron */2 -> /root/scripts/host_heartbeat.sh, без единой зависимости).
+# Протух или недостижим -> тревога Стасу в Telegram НАПРЯМУЮ через api.telegram.org
+# (наш сервер в доставке не участвует) + падение job -> письмо владельцу репо.
+#
+# Перестроено 2026-09-02. Что было сломано:
+#   1) стучался на IP погашенного 31.08 сервера 157.180.45.96;
+#   2) heartbeat писался только при живом agent-supervisor.timer, который погасили
+#      30.08 вместе с MemPalace -> штамп замёрз на 29.08;
+#   3) старый путь /files/*.txt с тех пор закрыт SSO -> отдавал бы 401, а не heartbeat;
+#   4) доставка была только письмом GitHub на sspoisk@gmail.com, в Telegram НИЧЕГО.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'yes = принудительно прогнать путь тревоги (ТЕСТ доставки)'
+        required: false
+        default: 'no'
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверить heartbeat сервера
+        id: probe
+        env:
+          TEST_ALERT: ${{ github.event.inputs.test_alert }}
+        run: |
+          URL="https://guardlabs.online/hb.txt"
+          MAX_AGE=900
+          reason=""
+          body="$(curl -s --max-time 25 "$URL" || true)"
+          if [ -z "$body" ]; then
+            echo "первая попытка пустая, повтор через 20с"
+            sleep 20
+            body="$(curl -s --max-time 25 "$URL" || true)"
+          fi
+          if [ -z "$body" ]; then
+            reason="СЕРВЕР НЕДОСТУПЕН: $URL не ответил (2 попытки подряд)"
+          else
+            echo "$body"
+            epoch="$(printf '%s' "$body" | grep -oE 'epoch=[0-9]+' | head -1 | cut -d= -f2)"
+            if [ -z "$epoch" ]; then
+              reason="heartbeat отдался, но формат сломан (нет epoch)"
+            else
+              age=$(( $(date -u +%s) - epoch ))
+              echo "возраст heartbeat: ${age}s (порог ${MAX_AGE}s)"
+              if [ "$age" -gt "$MAX_AGE" ]; then
+                reason="heartbeat ПРОТУХ: ${age}s без обновления (порог ${MAX_AGE}s)"
+              fi
+            fi
+          fi
+          if [ "$TEST_ALERT" = "yes" ]; then
+            if [ -z "$reason" ]; then
+              reason="ТЕСТ канала доставки, сервер на самом деле жив"
+            else
+              reason="ТЕСТ (учебная тревога, реагировать не надо): $reason"
+            fi
+          fi
+          if [ -n "$reason" ]; then echo "НЕ ОК: $reason"; else echo "OK: сервер жив, штамп свежий"; fi
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+
+      - name: Keepalive репозитория
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # раз в сутки трогаем файл: репо без активности GitHub считает спящим
+          h="$(date -u +%H)"; m="$(date -u +%M)"
+          if [ "$h" != "03" ] || [ "$m" -ge 30 ]; then echo "не время keepalive"; exit 0; fi
+          F=".deadman_keepalive"
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${F}" --jq .sha 2>/dev/null || true)"
+          content="$(date -u '+%Y-%m-%dT%H:%M:%SZ external deadman alive' | base64 -w0)"
+          if [ -n "$sha" ]; then
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${F}" \
+              -f message="deadman keepalive" -f content="$content" -f sha="$sha" || true
+          else
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${F}" \
+              -f message="deadman keepalive" -f content="$content" || true
+          fi
+
+      - name: Тревога Стасу в Telegram
+        id: tg
+        continue-on-error: true   # Telegram отвалился -> всё равно доходим до письма
+        if: steps.probe.outputs.reason != ''
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REASON: ${{ steps.probe.outputs.reason }}
+        run: |
+          test -n "$TG_BOT_TOKEN" || { echo "нет секрета TG_BOT_TOKEN"; exit 1; }
+          text="$(printf '%s\n%s\n\n%s\n%s\n\n%s' \
+            "🔴 ДЕД-МАН: СЕРВЕР НЕ ОТВЕЧАЕТ" \
+            "$REASON" \
+            "Проверено извне, с инфры GitHub — $(date -u '+%Y-%m-%d %H:%M UTC')." \
+            "Точка проверки: https://guardlabs.online/hb.txt" \
+            "Если в тексте нет слова ТЕСТ — сервер лёг, и сам он об этом сказать не может.")"
+          code="$(curl -s -o /tmp/tg.json -w '%{http_code}' -X POST \
+            "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${text}")"
+          echo "telegram http=$code"
+          cat /tmp/tg.json
+          grep -q '"ok":true' /tmp/tg.json || { echo "ДОСТАВКА НЕ УДАЛАСЬ"; exit 1; }
+          echo "тревога доставлена в Telegram"
+
+      # Падение job = второй, независимый от Telegram канал: GitHub шлёт письмо владельцу
+      # репо. Тревога уже ушла шагом выше, тут только дублируем её в почту.
+      - name: СЕРВЕР ЛЁЖИТ - уронить job ради письма владельцу
+        if: steps.probe.outputs.reason != ''
+        env:
+          REASON: ${{ steps.probe.outputs.reason }}
+          TG: ${{ steps.tg.outcome }}
+        run: |
+          echo "ПРИЧИНА ТРЕВОГИ: $REASON"
+          echo "доставка в Telegram: $TG"
+          echo "Это НЕ поломка workflow. Workflow отработал правильно и сообщает, что сервер не отвечает."
+          exit 1
